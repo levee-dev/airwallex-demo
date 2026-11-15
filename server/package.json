@@ -1,0 +1,29 @@
+{
+  "name": "server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../.env src/main.ts",
+    "start": "tsx --env-file-if-exists=../.env src/main.ts",
+    "acme": "tsx --env-file-if-exists=../.env scripts/acme.ts",
+    "db:migrate": "tsx --env-file-if-exists=../.env scripts/acme.ts migrate",
+    "db:generate": "drizzle-kit generate",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.8",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.18",
+    "pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@types/pg": "^8.23.1",
+    "@types/web-push": "^3.6.4",
+    "drizzle-kit": "^0.31.11",
+    "vitest": "^5.1.0"
+  }
+}

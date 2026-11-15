@@ -1,0 +1,39 @@
+{
+  "name": "airwallex-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Acme Pay: a reference consumer fintech on Airwallex Issuing where every AI agent purchase is authorized by Levee.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.9"
+  },
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "npm run acme -w server -- dev",
+    "build": "npm run build -w web",
+    "start": "npm run start -w server",
+    "setup": "npm run acme -w server -- setup",
+    "acme": "npm run acme -w server --",
+    "db:migrate": "npm run db:migrate -w server",
+    "db:generate": "npm run db:generate -w server",
+    "test": "npm test -w server",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "tsc -p server --noEmit && tsc -p web --noEmit"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "concurrently": "^10.0.7",
+    "eslint": "^10.15.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.14.0",
+    "prettier": "^3.10.1",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.72.2"
+  }
+}
