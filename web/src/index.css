@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    -webkit-tap-highlight-color: transparent;
+  }
+  ::selection {
+    background: #8ee0c5;
+    color: #10251e;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 h-12 text-[15px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 disabled:opacity-50 disabled:cursor-not-allowed select-none;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accent-hover;
+  }
+  .btn-secondary {
+    @apply btn bg-white text-ink border border-line hover:bg-canvas;
+  }
+  .card {
+    @apply bg-white border border-line rounded-2xl shadow-card;
+  }
+  .input-wrap {
+    @apply flex items-center gap-3 h-14 px-4 rounded-xl bg-white border border-line focus-within:border-accent focus-within:ring-1 focus-within:ring-accent transition;
+  }
+  .input-wrap input {
+    @apply flex-1 min-w-0 bg-transparent outline-none text-[16px] placeholder:text-ink-3;
+  }
+  .label {
+    @apply block text-[15px] font-semibold text-ink mb-2;
+  }
+  .hint {
+    @apply text-[13px] text-ink-2 mt-2;
+  }
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[13px] font-semibold;
+  }
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
