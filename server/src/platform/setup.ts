@@ -1,9 +1,10 @@
+import webpush from 'web-push';
 import type { AirwallexClient } from '../airwallex/client';
 import type { Database } from '../db/client';
 import { AppError } from '../lib/errors';
 import { LeveeClient, LeveeError } from '../levee/client';
 import type { LeveeTenant } from '../levee/types';
-import { savePlatformCredentials, type PlatformCredentials } from './platform';
+import { savePlatformCredentials, storedVapidKeys, type PlatformCredentials } from './platform';
 
 export interface SetupInput {
   readonly leveePlatformKey: string;
@@ -17,8 +18,20 @@ export interface SetupReport {
   readonly leveePlatformId: string;
   readonly tenantName: string | null;
   readonly rpId: string;
-  readonly addedOrigin: boolean;
+  /** The RP ID the tenant had before, when setup replaced a different one. */
+  readonly previousRpId: string | null;
+  /** True when the tenant's passkey settings were written (RP ID or origins changed). */
+  readonly updatedWebauthn: boolean;
+  readonly origins: readonly string[];
+  /** True when setup generated a new Web Push key pair (none was stored yet). */
+  readonly generatedVapid: boolean;
   readonly warnings: readonly string[];
+}
+
+/** What the operator is asked before setup replaces the tenant's RP ID. */
+export interface RpIdChange {
+  readonly from: string;
+  readonly to: string;
 }
 
 export interface SetupDependencies {
@@ -28,6 +41,18 @@ export interface SetupDependencies {
   readonly leveeApiUrl: string;
   readonly leveeConsoleOrigin: string;
   readonly airwallex: AirwallexClient;
+  /** ACME_PASSKEY_RP_ID: a registrable suffix of the public URL's host, or null for the host itself. */
+  readonly passkeyRpIdOverride?: string | null;
+  /**
+   * Called before replacing a different RP ID on the tenant, since passkeys registered under the old
+   * one stop working. Return true to go ahead. Without it, a different RP ID is refused.
+   */
+  readonly confirmRpIdChange?: (change: RpIdChange) => Promise<boolean>;
+  /**
+   * False leaves the tenant's passkey settings alone: `npm run dev` points them at each run's tunnel
+   * itself. Default true.
+   */
+  readonly managePasskeys?: boolean;
   readonly fetch?: typeof fetch;
   readonly now?: () => Date;
 }
@@ -42,6 +67,8 @@ const FORMATS: ReadonlyArray<readonly [keyof SetupInput, RegExp, string]> = [
 
 function checkFormats(input: SetupInput): void {
   for (const [field, pattern, message] of FORMATS) {
+    // Local development registers its own webhook endpoint, so the operator's secret may be blank.
+    if (field === 'webhookSecret' && input.webhookSecret === '') continue;
     if (!pattern.test(input[field])) throw new AppError(400, 'invalid_setup', message);
   }
 }
@@ -53,16 +80,76 @@ function leveeFailure(error: unknown, action: string): AppError {
   return new AppError(502, 'levee_unreachable', `Levee could not be reached while ${action}.`);
 }
 
-/** The RP ID must be the app's host or a parent domain of it, or browsers refuse the passkey. */
-function rpCovers(rpId: string, publicUrl: string): boolean {
-  const host = new URL(publicUrl).hostname;
-  return host === rpId || host.endsWith(`.${rpId}`);
+const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+
+/**
+ * Shared hosting suffixes where every customer gets a subdomain. They are public suffixes, so
+ * browsers refuse them as an RP ID; the app's own subdomain has to be the RP ID instead.
+ */
+const SHARED_SUFFIXES: readonly string[] = [
+  'trycloudflare.com',
+  'pages.dev',
+  'workers.dev',
+  'ngrok.io',
+  'ngrok.app',
+  'ngrok-free.app',
+  'vercel.app',
+  'netlify.app',
+  'github.io',
+  'herokuapp.com',
+  'onrender.com',
+  'fly.dev',
+];
+
+/**
+ * The passkey RP ID for an app served at `publicUrl`: its host, or `override` when that is a
+ * registrable suffix of the host (`pay.example.com` may use `example.com`). Follows Levee's rules
+ * for a tenant RP ID: a bare hostname, never an IP address. Levee also refuses localhost on
+ * production tenants; that is Levee's call, so it is not checked here.
+ */
+export function derivePasskeyRpId(publicUrl: string, override?: string | null): string {
+  const host = new URL(publicUrl).hostname.toLowerCase();
+  if (IPV4.test(host) || host.startsWith('[')) {
+    throw new AppError(
+      400,
+      'invalid_rp_id',
+      `Passkeys need a hostname, not an IP address. Open the app at a hostname (localhost or a domain) instead of ${host}.`,
+    );
+  }
+  const candidate = override?.trim().toLowerCase().replace(/\.$/, '') ?? '';
+  if (candidate === '') return host;
+  if (candidate.length > 253 || !HOSTNAME.test(candidate) || IPV4.test(candidate)) {
+    throw new AppError(
+      400,
+      'invalid_rp_id',
+      'ACME_PASSKEY_RP_ID must be a bare hostname, with no scheme, port or path.',
+    );
+  }
+  if (host !== candidate && !host.endsWith(`.${candidate}`)) {
+    throw new AppError(
+      400,
+      'invalid_rp_id',
+      `ACME_PASSKEY_RP_ID ${candidate} must be ${host} or a parent domain of it.`,
+    );
+  }
+  const publicSuffix = (!candidate.includes('.') && candidate !== 'localhost') || SHARED_SUFFIXES.includes(candidate);
+  if (publicSuffix) {
+    throw new AppError(
+      400,
+      'invalid_rp_id',
+      `ACME_PASSKEY_RP_ID ${candidate} is a public suffix that browsers refuse as an RP ID; use ${host}.`,
+    );
+  }
+  return candidate;
 }
 
 /**
  * Checks the operator's credentials against Levee and Airwallex, then stores them encrypted.
  * Levee: the key names its platform, the platform owns the tenant, and the tenant is a sandbox
- * consumer program whose passkey origins include this app (added when missing).
+ * consumer program. Setup sets the tenant's passkey RP ID to this app's host (or ACME_PASSKEY_RP_ID)
+ * and its origins to this app's origin, asking first when that replaces a different RP ID.
+ * Push: a Web Push (VAPID) key pair is generated once and stored encrypted.
  * Airwallex: the keys sign in and can use the Connected Account APIs.
  */
 export async function runSetup(deps: SetupDependencies, input: SetupInput): Promise<SetupReport> {
@@ -99,28 +186,52 @@ export async function runSetup(deps: SetupDependencies, input: SetupInput): Prom
   if (tenant.program_type !== 'consumer') {
     throw new AppError(403, 'levee_tenant_mismatch', 'Acme Pay needs a consumer program tenant.');
   }
-  const rpId = tenant.webauthn?.rpId;
-  if (rpId === undefined || rpId.length === 0) {
-    throw new AppError(
-      409,
-      'levee_rp_missing',
-      'Set the tenant passkey relying party (RP ID) in the Levee console first.',
-    );
+  const managePasskeys = deps.managePasskeys ?? true;
+  const currentRpId = tenant.webauthn?.rpId ?? '';
+  const currentOrigins = tenant.webauthn?.origins ?? [];
+  const rpId = managePasskeys ? derivePasskeyRpId(deps.publicUrl, deps.passkeyRpIdOverride) : currentRpId;
+  // Android app origins are not web origins and do not depend on the RP ID host; they are kept.
+  const apps = currentOrigins.filter((entry) => entry.startsWith('android:'));
+  const origins = managePasskeys ? [deps.publicUrl, ...apps] : [...currentOrigins];
+  const previousRpId = currentRpId !== '' && currentRpId.toLowerCase() !== rpId ? currentRpId : null;
+  if (previousRpId !== null) {
+    const confirmed = (await deps.confirmRpIdChange?.({ from: previousRpId, to: rpId })) ?? false;
+    if (!confirmed) {
+      throw new AppError(
+        409,
+        'rp_id_change_not_confirmed',
+        `The tenant passkey RP ID is ${previousRpId}; this app needs ${rpId}. Passkeys registered under ${previousRpId} stop working after the change. Run setup again and confirm, or pass --force-rp-id.`,
+      );
+    }
   }
-
-  const origins = tenant.webauthn?.origins ?? [];
-  const addedOrigin = !origins.includes(deps.publicUrl);
-  if (addedOrigin) {
+  const updatedWebauthn =
+    currentRpId.toLowerCase() !== rpId ||
+    currentOrigins.length !== origins.length ||
+    currentOrigins.some((entry, i) => entry !== origins[i]);
+  if (updatedWebauthn) {
     const path = `/v1/platforms/${encodeURIComponent(platformId)}/tenants/${encodeURIComponent(tenant.id)}/webauthn`;
     try {
-      await levee.patch(path, { rp_id: rpId, origins: [...origins, deps.publicUrl] });
+      await levee.patch(path, { rp_id: rpId, origins });
     } catch (error) {
-      throw leveeFailure(error, 'adding this app to the tenant passkey origins');
+      if (error instanceof LeveeError && error.status === 400) {
+        const local =
+          rpId === 'localhost'
+            ? ' Levee does not allow localhost on this tenant; serve the app on a public HTTPS URL (npm run dev:tunnel) and run setup there.'
+            : '';
+        throw new AppError(
+          400,
+          'levee_rp_refused',
+          `Levee refused RP ID ${rpId} with origin ${deps.publicUrl}: ${error.message}.${local}`,
+        );
+      }
+      throw leveeFailure(error, 'setting the tenant passkey RP ID and origins');
     }
   }
 
   const airwallex = { clientId: input.airwallexClientId, apiKey: input.airwallexApiKey };
   await deps.airwallex.verify(airwallex);
+  // Kept across runs: a new key pair would silently invalidate every phone's subscription.
+  const existingVapid = await storedVapidKeys(deps.db, deps.encryptionKey);
 
   const credentials: PlatformCredentials = {
     leveePlatformId: platformId,
@@ -128,11 +239,27 @@ export async function runSetup(deps: SetupDependencies, input: SetupInput): Prom
     leveePlatformKey: input.leveePlatformKey,
     airwallex,
     webhookSecret: input.webhookSecret,
+    vapid: existingVapid ?? webpush.generateVAPIDKeys(),
   };
-  await savePlatformCredentials(deps.db, deps.encryptionKey, credentials, deps.now?.() ?? new Date());
+  await savePlatformCredentials(
+    deps.db,
+    deps.encryptionKey,
+    credentials,
+    deps.now?.() ?? new Date(),
+    rpId === '' ? null : rpId,
+  );
 
-  const warnings = rpCovers(rpId, deps.publicUrl)
+  const warnings = deps.publicUrl.startsWith('https:')
     ? []
-    : [`The tenant RP ID ${rpId} does not cover ${deps.publicUrl}; passkeys will fail until they match.`];
-  return { leveePlatformId: platformId, tenantName: tenant.display_name ?? null, rpId, addedOrigin, warnings };
+    : [`Phone notifications need a public HTTPS URL; ${deps.publicUrl} only works on this computer.`];
+  return {
+    leveePlatformId: platformId,
+    tenantName: tenant.display_name ?? null,
+    rpId,
+    previousRpId,
+    updatedWebauthn,
+    origins,
+    generatedVapid: existingVapid === null,
+    warnings,
+  };
 }
